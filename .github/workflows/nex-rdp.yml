@@ -36,18 +36,21 @@ jobs:
             "LOCKED_PHONE_IP=$phoneIp" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
 
-      - name: Configure Phone-Only Locked RDP
+      - name: Configure Phone-Only Locked RDP & 100% Scaling
         shell: pwsh
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableClip" -Value 0 -Force
+          New-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Name "IgnoreClientDesktopScaleFactor" -Value 0 -Force
           netsh advfirewall firewall set rule group="remote desktop" new enable=No 2>$null
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall delete rule name="RDP-Phone-Only" 2>$null
           if (-not [string]::IsNullOrWhiteSpace($env:LOCKED_PHONE_IP)) {
             netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 remoteip=$env:LOCKED_PHONE_IP | Out-Null
-            Write-Host "Firewall locked: ONLY your phone IP can connect to RDP."
+            Write-Host "Firewall locked strictly to authorized phone IP."
           } else {
             netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           }
@@ -59,6 +62,7 @@ jobs:
           $fixedPass = "${{ secrets.RDP_FIXED_PASSWORD }}"
           if (-not [string]::IsNullOrWhiteSpace($fixedPass)) {
             $password = $fixedPass
+            "FIXED_PASS_USED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
           } else {
             $upper = [char[]](65..90)
             $lower = [char[]](97..122)
@@ -70,6 +74,7 @@ jobs:
             $chars += $nums | Get-Random -Count 4
             $chars += $syms | Get-Random -Count 3
             $password = -join ($chars | Sort-Object { Get-Random })
+            "FIXED_PASS_USED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
           Write-Host "::add-mask::$password"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -78,7 +83,7 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install & Connect Tailscale
+      - name: Install & Connect Tailscale (Fixed Hostname nex-pc)
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
@@ -87,7 +92,7 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $msi -TimeoutSec 60
           Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
           Remove-Item $msi -Force
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="nex-rdp-$env:GITHUB_RUN_ID" --unattended
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="nex-pc" --unattended
           $tsIP = $null
           for ($i = 0; $i -lt 15; $i++) {
             $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
@@ -95,11 +100,20 @@ jobs:
             Start-Sleep -Seconds 3
           }
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Make sure TAILSCALE_AUTH_KEY is Reusable and valid."
+            Write-Error "Tailscale IP not assigned. Check Reusable TAILSCALE_AUTH_KEY."
             exit 1
           }
+          $tsHost = "nex-pc"
+          try {
+            $st = (& "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null) | ConvertFrom-Json
+            if ($st.Self.DNSName) {
+              $tsHost = $st.Self.DNSName.TrimEnd('.')
+            }
+          } catch {}
           Write-Host "::add-mask::$tsIP"
+          Write-Host "::add-mask::$tsHost"
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TAILSCALE_HOST=$tsHost" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Prepare Roblox Studio Installer
         if: ${{ inputs.download_roblox != false }}
@@ -117,15 +131,18 @@ jobs:
             Write-Host "Skipped Roblox download."
           }
 
-      - name: Push Session Privately Over Tailscale
+      - name: Push Session Privately & Listen for Clean Logout
         shell: pwsh
         run: |
           $phoneIp = $env:LOCKED_PHONE_IP
+          $startUtc = [DateTime]::UtcNow
           $startedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
           $payload = @{
             ip = $env:TAILSCALE_IP
+            host = $env:TAILSCALE_HOST
             user = "RDP"
             password = $env:RDP_PASSWORD
+            fixedPass = ($env:FIXED_PASS_USED -eq "true")
             runId = $env:GITHUB_RUN_ID
             startedAt = $startedMs
             status = "online"
@@ -151,15 +168,34 @@ jobs:
 
           Write-Host "Runner online and locked to authorized phone."
           while ($true) {
+            if (([DateTime]::UtcNow - $startUtc).TotalMinutes -ge 355) {
+              Write-Host "5h55m reached — running clean Tailscale logout so nex-pc stays reserved."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+              break
+            }
+
             if ($pendingTask -and $pendingTask.IsCompleted) {
               try {
                 $ctx = $pendingTask.Result
-                $buf = [System.Text.Encoding]::UTF8.GetBytes($payload)
-                $ctx.Response.StatusCode = 200
-                $ctx.Response.ContentType = "application/json"
-                $ctx.Response.ContentLength64 = $buf.Length
-                $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
-                $ctx.Response.OutputStream.Close()
+                $reqPath = $ctx.Request.Url.AbsolutePath
+                if ($reqPath -eq "/logout") {
+                  $okBuf = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"logout":true}')
+                  $ctx.Response.StatusCode = 200
+                  $ctx.Response.ContentType = "application/json"
+                  $ctx.Response.ContentLength64 = $okBuf.Length
+                  $ctx.Response.OutputStream.Write($okBuf, 0, $okBuf.Length)
+                  $ctx.Response.OutputStream.Close()
+                  Write-Host "Clean logout requested by phone. Freeing nex-pc hostname..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+                  break
+                } else {
+                  $buf = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                  $ctx.Response.StatusCode = 200
+                  $ctx.Response.ContentType = "application/json"
+                  $ctx.Response.ContentLength64 = $buf.Length
+                  $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+                  $ctx.Response.OutputStream.Close()
+                }
               } catch {}
               $pendingTask = $listener.GetContextAsync()
             }
@@ -179,5 +215,5 @@ jobs:
                 } catch {}
               }
             }
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds 400
           }

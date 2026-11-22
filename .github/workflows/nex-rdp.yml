@@ -41,13 +41,15 @@ jobs:
           if (-not [string]::IsNullOrWhiteSpace($phoneIp)) {
             Write-Host "::add-mask::$phoneIp"
             "LOCKED_PHONE_IP=$phoneIp" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "Authorized phone IP detected and masked."
           }
 
-      - name: Configure Phone-Only Locked RDP & 100% Scaling
+      - name: Configure Phone-Only Locked RDP & Fix Paging Popup
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          try {
+            Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'TempPageFile' -ErrorAction SilentlyContinue
+          } catch {}
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
@@ -60,8 +62,6 @@ jobs:
             netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 remoteip="$($env:LOCKED_PHONE_IP)" | Out-Null
             if ($LASTEXITCODE -ne 0) {
               netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 | Out-Null
-            } else {
-              Write-Host "Firewall locked strictly to authorized phone IP."
             }
           } else {
             netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 | Out-Null
@@ -146,21 +146,84 @@ jobs:
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TAILSCALE_HOST=$tsHost" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Prepare Roblox Studio Installer
-        if: ${{ inputs.download_roblox != false }}
+      - name: Remove Edge, Clean Desktop & Install Telegram + Roblox Studio
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $ProgressPreference = 'SilentlyContinue'
           $desk = "C:\Users\Public\Desktop"
+          $tools = "C:\NexTools"
           $plugins = "C:\Users\RDP\AppData\Local\Roblox\Plugins"
-          New-Item -ItemType Directory -Force -Path $desk | Out-Null
-          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
-          try {
-            Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile "$desk\RobloxStudioInstaller.exe" -TimeoutSec 35
-            Write-Host "Roblox Studio installer ready on Desktop."
-          } catch {
-            Write-Host "Skipped Roblox download."
+          New-Item -ItemType Directory -Force -Path $desk, $tools, $plugins | Out-Null
+
+          Get-Process msedge, MicrosoftEdgeUpdate -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $edgeSetup = Get-ChildItem -Path "C:\Program Files (x86)\Microsoft\Edge\Application\*\Installer\setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($edgeSetup) {
+            try {
+              Start-Process -FilePath $edgeSetup.FullName -ArgumentList "--uninstall", "--system-level", "--verbose-logging", "--force-uninstall" -Wait -NoNewWindow
+            } catch {}
           }
+          Remove-Item -Path "C:\Program Files (x86)\Microsoft\Edge" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Users\Default\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
+
+          foreach ($d in @($desk, "C:\Users\Default\Desktop")) {
+            if (Test-Path $d) {
+              Get-ChildItem -Path $d -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          try {
+            $hidePath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel'
+            if (-not (Test-Path $hidePath)) { New-Item -Path $hidePath -Force | Out-Null }
+            Set-ItemProperty -Path $hidePath -Name '{645FF040-5081-101B-9F08-00AA002F954E}' -Value 1 -Type DWord -Force
+          } catch {}
+
+          $ws = New-Object -ComObject WScript.Shell
+
+          $chromeExe = @("C:\Program Files\Google\Chrome\Application\chrome.exe", "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($chromeExe) {
+            $sc = $ws.CreateShortcut("$desk\Google Chrome.lnk")
+            $sc.TargetPath = $chromeExe
+            $sc.Save()
+          }
+
+          $fm = $ws.CreateShortcut("$desk\File Manager.lnk")
+          $fm.TargetPath = "C:\Windows\explorer.exe"
+          $fm.IconLocation = "C:\Windows\explorer.exe,0"
+          $fm.Save()
+
+          try {
+            $tgZip = "$env:TEMP\telegram.zip"
+            $tgDir = "$tools\Telegram"
+            New-Item -ItemType Directory -Force -Path $tgDir | Out-Null
+            Invoke-WebRequest -Uri "https://telegram.org/dl/desktop/win64_portable" -OutFile $tgZip -TimeoutSec 60
+            Expand-Archive -Path $tgZip -DestinationPath $tgDir -Force
+            Remove-Item $tgZip -Force -ErrorAction SilentlyContinue
+            $tgExe = Get-ChildItem -Path $tgDir -Recurse -Filter "Telegram.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($tgExe) {
+              $tgs = $ws.CreateShortcut("$desk\Telegram.lnk")
+              $tgs.TargetPath = $tgExe.FullName
+              $tgs.WorkingDirectory = $tgExe.DirectoryName
+              $tgs.Save()
+              Write-Host "Telegram Desktop installed and pinned to Desktop."
+            }
+          } catch {
+            Write-Host "Telegram portable skipped: $($_.Exception.Message)"
+          }
+
+          if ("${{ inputs.download_roblox }}" -ne "false") {
+            try {
+              Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile "$desk\Roblox Studio.exe" -TimeoutSec 40
+              Write-Host "Roblox Studio ready on Desktop."
+            } catch {
+              Write-Host "Skipped Roblox download."
+            }
+          }
+
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Push Session Privately & Listen for Clean Logout
         shell: pwsh

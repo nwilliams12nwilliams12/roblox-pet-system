@@ -112,7 +112,7 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install & Connect Tailscale (Fixed Hostname nex-pc)
+      - name: Install & Connect Tailscale (nex-pc + Exit Node)
         shell: pwsh
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -128,7 +128,6 @@ jobs:
           Write-Host "[2/5] Installing Tailscale MSI..."
           $proc = Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -PassThru
           if (-not $proc.WaitForExit(90000)) {
-            Write-Host "MSI installer timed out at 90s; terminating..."
             try { $proc.Kill() } catch {}
           }
           Remove-Item $msi -Force -ErrorAction SilentlyContinue
@@ -149,15 +148,14 @@ jobs:
             exit 1
           }
 
-          Write-Host "[4/5] Connecting to Tailscale as nex-pc..."
+          Write-Host "[4/5] Connecting to Tailscale as nex-pc (Exit Node enabled)..."
           $tsKey = $env:TS_KEY.Trim()
-          & $tsExe up --authkey="$tsKey" --hostname="nex-pc" --unattended --force-reauth --reset --timeout=45s
+          & $tsExe up --authkey="$tsKey" --hostname="nex-pc" --advertise-exit-node --unattended --force-reauth --reset --timeout=45s
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "Attempt 1 failed (exit $LASTEXITCODE). Retrying..."
             Start-Sleep -Seconds 5
-            & $tsExe up --authkey="$tsKey" --hostname="nex-pc" --unattended --force-reauth --reset --timeout=45s
+            & $tsExe up --authkey="$tsKey" --hostname="nex-pc" --advertise-exit-node --unattended --force-reauth --reset --timeout=45s
             if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale auth failed! Make sure TAILSCALE_AUTH_KEY is Reusable and not expired."
+              Write-Error "Tailscale auth failed! Make sure TAILSCALE_AUTH_KEY is Reusable and valid."
               exit 1
             }
           }
@@ -184,9 +182,9 @@ jobs:
           Write-Host "::add-mask::$tsHost"
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TAILSCALE_HOST=$tsHost" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Tailscale connected cleanly!"
+          Write-Host "Tailscale connected with Exit Node!"
 
-      - name: Remove Edge, Clean Desktop & Install Telegram + Roblox Studio
+      - name: Remove Edge & Firefox, Clean Desktop & Install Telegram + Roblox Studio
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
@@ -195,8 +193,9 @@ jobs:
           $plugins = "C:\Users\RDP\AppData\Local\Roblox\Plugins"
           New-Item -ItemType Directory -Force -Path $desk, $tools, $plugins | Out-Null
 
-          Write-Host "[1/4] Removing Microsoft Edge..."
-          Get-Process msedge, MicrosoftEdgeUpdate -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "[1/4] Removing Microsoft Edge & Mozilla Firefox..."
+          Get-Process msedge, MicrosoftEdgeUpdate, firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
           $edgeSetup = Get-ChildItem -Path "C:\Program Files (x86)\Microsoft\Edge\Application\*\Installer\setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($edgeSetup) {
             try {
@@ -208,6 +207,19 @@ jobs:
           Remove-Item -Path "C:\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\Users\Default\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
+
+          $ffUninst = @("C:\Program Files\Mozilla Firefox\uninstall\helper.exe", "C:\Program Files (x86)\Mozilla Firefox\uninstall\helper.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($ffUninst) {
+            try {
+              $fp = Start-Process -FilePath $ffUninst -ArgumentList "/S" -PassThru -NoNewWindow
+              if (-not $fp.WaitForExit(20000)) { try { $fp.Kill() } catch {} }
+            } catch {}
+          }
+          Remove-Item -Path "C:\Program Files\Mozilla Firefox" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Program Files (x86)\Mozilla Firefox" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Program Files (x86)\Mozilla Maintenance Service" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Firefox.lnk" -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Mozilla Firefox.lnk" -Force -ErrorAction SilentlyContinue
 
           Write-Host "[2/4] Cleaning Desktop icons..."
           foreach ($d in @($desk, "C:\Users\Default\Desktop")) {
@@ -249,21 +261,15 @@ jobs:
                 $tgs.TargetPath = $tgExe.FullName
                 $tgs.WorkingDirectory = $tgExe.DirectoryName
                 $tgs.Save()
-                Write-Host "Telegram ready on Desktop."
               }
             }
-          } catch {
-            Write-Host "Telegram install skipped."
-          }
+          } catch {}
 
           Write-Host "[4/4] Preparing Roblox Studio..."
           if ("${{ inputs.download_roblox }}" -ne "false") {
             try {
               curl.exe -fsSL --connect-timeout 15 --max-time 45 "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -o "$desk\Roblox Studio.exe"
-              Write-Host "Roblox Studio ready on Desktop."
-            } catch {
-              Write-Host "Skipped Roblox download."
-            }
+            } catch {}
           }
 
           $global:LASTEXITCODE = 0

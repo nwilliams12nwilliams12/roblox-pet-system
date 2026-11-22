@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       phone_ip:
-        description: Phone Tailscale IP
+        description: Optional fallback Phone Tailscale IP
         required: false
         default: ""
         type: string
@@ -20,37 +20,57 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Verify Tailscale Key
+      - name: Verify Secrets
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace("${{ secrets.TAILSCALE_AUTH_KEY }}")) {
-            Write-Error "TAILSCALE_AUTH_KEY secret is missing in Repo Settings -> Secrets -> Actions!"
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing!"
             exit 1
           }
+          $phoneIp = "${{ secrets.PHONE_TAILSCALE_IP }}"
+          if ([string]::IsNullOrWhiteSpace($phoneIp)) {
+            $phoneIp = "${{ inputs.phone_ip }}"
+          }
+          if (-not [string]::IsNullOrWhiteSpace($phoneIp)) {
+            Write-Host "::add-mask::$phoneIp"
+            "LOCKED_PHONE_IP=$phoneIp" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
 
-      - name: Configure Core RDP Settings
+      - name: Configure Phone-Only Locked RDP
         shell: pwsh
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall set rule group="remote desktop" new enable=No 2>$null
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall delete rule name="RDP-Phone-Only" 2>$null
+          if (-not [string]::IsNullOrWhiteSpace($env:LOCKED_PHONE_IP)) {
+            netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 remoteip=$env:LOCKED_PHONE_IP | Out-Null
+            Write-Host "Firewall locked: ONLY your phone IP can connect to RDP."
+          } else {
+            netsh advfirewall firewall add rule name="RDP-Phone-Only" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          }
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User Securely
+      - name: Create Encrypted RDP User
         shell: pwsh
         run: |
-          $upper = [char[]](65..90)
-          $lower = [char[]](97..122)
-          $nums = [char[]](48..57)
-          $syms = @('@', '#', '!', '%', '-', '_')
-          $chars = @()
-          $chars += $upper | Get-Random -Count 4
-          $chars += $lower | Get-Random -Count 5
-          $chars += $nums | Get-Random -Count 4
-          $chars += $syms | Get-Random -Count 3
-          $password = -join ($chars | Sort-Object { Get-Random })
+          $fixedPass = "${{ secrets.RDP_FIXED_PASSWORD }}"
+          if (-not [string]::IsNullOrWhiteSpace($fixedPass)) {
+            $password = $fixedPass
+          } else {
+            $upper = [char[]](65..90)
+            $lower = [char[]](97..122)
+            $nums = [char[]](48..57)
+            $syms = @('@', '#', '!', '%', '-', '_')
+            $chars = @()
+            $chars += $upper | Get-Random -Count 4
+            $chars += $lower | Get-Random -Count 5
+            $chars += $nums | Get-Random -Count 4
+            $chars += $syms | Get-Random -Count 3
+            $password = -join ($chars | Sort-Object { Get-Random })
+          }
           Write-Host "::add-mask::$password"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
@@ -61,9 +81,10 @@ jobs:
       - name: Install & Connect Tailscale
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $msi
+          Invoke-WebRequest -Uri $tsUrl -OutFile $msi -TimeoutSec 60
           Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
           Remove-Item $msi -Force
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="nex-rdp-$env:GITHUB_RUN_ID" --unattended
@@ -74,7 +95,7 @@ jobs:
             Start-Sleep -Seconds 3
           }
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Make sure your TAILSCALE_AUTH_KEY is Reusable and not expired!"
+            Write-Error "Tailscale IP not assigned. Make sure TAILSCALE_AUTH_KEY is Reusable and valid."
             exit 1
           }
           Write-Host "::add-mask::$tsIP"
@@ -84,24 +105,22 @@ jobs:
         if: ${{ inputs.download_roblox != false }}
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           $desk = "C:\Users\Public\Desktop"
           $plugins = "C:\Users\RDP\AppData\Local\Roblox\Plugins"
           New-Item -ItemType Directory -Force -Path $desk | Out-Null
           New-Item -ItemType Directory -Force -Path $plugins | Out-Null
           try {
-            Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile "$desk\RobloxStudioInstaller.exe"
+            Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile "$desk\RobloxStudioInstaller.exe" -TimeoutSec 35
             Write-Host "Roblox Studio installer ready on Desktop."
           } catch {
             Write-Host "Skipped Roblox download."
           }
 
-      - name: Push Session Over Tailscale & Stay Alive
+      - name: Push Session Privately Over Tailscale
         shell: pwsh
         run: |
-          $phoneIp = "${{ secrets.PHONE_TAILSCALE_IP }}"
-          if ([string]::IsNullOrWhiteSpace($phoneIp)) {
-            $phoneIp = "${{ inputs.phone_ip }}"
-          }
+          $phoneIp = $env:LOCKED_PHONE_IP
           $startedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
           $payload = @{
             ip = $env:TAILSCALE_IP
@@ -110,17 +129,55 @@ jobs:
             runId = $env:GITHUB_RUN_ID
             startedAt = $startedMs
             status = "online"
+            locked = (-not [string]::IsNullOrWhiteSpace($phoneIp))
           } | ConvertTo-Json -Compress
 
-          Write-Host "RDP Runner is ONLINE. Credentials are being pushed privately over Tailscale to your phone."
-          while ($true) {
+          $listener = $null
+          try {
+            netsh advfirewall firewall delete rule name="NexRDP-Pull" 2>$null
             if (-not [string]::IsNullOrWhiteSpace($phoneIp)) {
-              try {
-                Invoke-RestMethod -Uri "http://${phoneIp}:34873/api/rdp-session" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 6 | Out-Null
-              } catch {}
-              try {
-                Invoke-RestMethod -Uri "http://${phoneIp}:34872/api/rdp-info" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 4 | Out-Null
-              } catch {}
+              netsh advfirewall firewall add rule name="NexRDP-Pull" dir=in action=allow protocol=TCP localport=34874 remoteip=$phoneIp | Out-Null
             }
-            Start-Sleep -Seconds 25
+            $listener = New-Object System.Net.HttpListener
+            $listener.Prefixes.Add("http://${env:TAILSCALE_IP}:34874/")
+            $listener.Start()
+          } catch {
+            $listener = $null
+          }
+
+          $pendingTask = if ($listener) { $listener.GetContextAsync() } else { $null }
+          $lastPush = [DateTime]::MinValue
+          $pushedOnce = $false
+
+          Write-Host "Runner online and locked to authorized phone."
+          while ($true) {
+            if ($pendingTask -and $pendingTask.IsCompleted) {
+              try {
+                $ctx = $pendingTask.Result
+                $buf = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                $ctx.Response.StatusCode = 200
+                $ctx.Response.ContentType = "application/json"
+                $ctx.Response.ContentLength64 = $buf.Length
+                $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+                $ctx.Response.OutputStream.Close()
+              } catch {}
+              $pendingTask = $listener.GetContextAsync()
+            }
+
+            if (([DateTime]::UtcNow - $lastPush).TotalSeconds -ge 10) {
+              $lastPush = [DateTime]::UtcNow
+              if (-not [string]::IsNullOrWhiteSpace($phoneIp)) {
+                try {
+                  Invoke-RestMethod -Uri "http://${phoneIp}:34873/api/rdp-session" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 5 | Out-Null
+                  if (-not $pushedOnce) {
+                    Write-Host "Private Tailscale handshake completed."
+                    $pushedOnce = $true
+                  }
+                } catch {}
+                try {
+                  Invoke-RestMethod -Uri "http://${phoneIp}:34872/api/rdp-info" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 3 | Out-Null
+                } catch {}
+              }
+            }
+            Start-Sleep -Milliseconds 500
           }

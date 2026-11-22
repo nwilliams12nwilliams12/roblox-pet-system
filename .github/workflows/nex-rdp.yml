@@ -117,26 +117,65 @@ jobs:
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $msi -TimeoutSec 60
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
-          Remove-Item $msi -Force
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$($env:TS_KEY.Trim())" --hostname="nex-pc" --unattended
+          Write-Host "[1/5] Downloading Tailscale MSI..."
+          curl.exe -fsSL --connect-timeout 15 --max-time 60 "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -o "$msi"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msi)) {
+            Write-Error "Failed to download Tailscale MSI!"
+            exit 1
+          }
+
+          Write-Host "[2/5] Installing Tailscale MSI..."
+          $proc = Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -PassThru
+          if (-not $proc.WaitForExit(90000)) {
+            Write-Host "MSI installer timed out at 90s; terminating..."
+            try { $proc.Kill() } catch {}
+          }
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+
+          Write-Host "[3/5] Starting Tailscale Windows service..."
+          for ($s = 0; $s -lt 10; $s++) {
+            $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+            if ($svc) {
+              if ($svc.Status -eq "Running") { break }
+              try { Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue } catch {}
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "tailscale.exe not found after installation!"
+            exit 1
+          }
+
+          Write-Host "[4/5] Connecting to Tailscale as nex-pc..."
+          $tsKey = $env:TS_KEY.Trim()
+          & $tsExe up --authkey="$tsKey" --hostname="nex-pc" --unattended --force-reauth --reset --timeout=45s
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Attempt 1 failed (exit $LASTEXITCODE). Retrying..."
+            Start-Sleep -Seconds 5
+            & $tsExe up --authkey="$tsKey" --hostname="nex-pc" --unattended --force-reauth --reset --timeout=45s
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale auth failed! Make sure TAILSCALE_AUTH_KEY is Reusable and not expired."
+              exit 1
+            }
+          }
+
+          Write-Host "[5/5] Fetching Tailscale IP..."
           $tsIP = $null
-          for ($i = 0; $i -lt 15; $i++) {
-            $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
+          for ($i = 0; $i -lt 12; $i++) {
+            $tsIP = (& $tsExe ip -4 2>$null | Select-Object -First 1)
             if ($tsIP -and $tsIP.StartsWith("100.")) { break }
-            Start-Sleep -Seconds 3
+            Start-Sleep -Seconds 2
           }
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Check Reusable TAILSCALE_AUTH_KEY."
+            Write-Error "Tailscale IP not assigned!"
             exit 1
           }
           $tsHost = "nex-pc"
           try {
-            $st = (& "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null) | ConvertFrom-Json
+            $st = (& $tsExe status --json 2>$null) | ConvertFrom-Json
             if ($st.Self.DNSName) {
               $tsHost = $st.Self.DNSName.TrimEnd('.')
             }
@@ -145,22 +184,24 @@ jobs:
           Write-Host "::add-mask::$tsHost"
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TAILSCALE_HOST=$tsHost" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale connected cleanly!"
 
       - name: Remove Edge, Clean Desktop & Install Telegram + Roblox Studio
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $ProgressPreference = 'SilentlyContinue'
           $desk = "C:\Users\Public\Desktop"
           $tools = "C:\NexTools"
           $plugins = "C:\Users\RDP\AppData\Local\Roblox\Plugins"
           New-Item -ItemType Directory -Force -Path $desk, $tools, $plugins | Out-Null
 
+          Write-Host "[1/4] Removing Microsoft Edge..."
           Get-Process msedge, MicrosoftEdgeUpdate -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $edgeSetup = Get-ChildItem -Path "C:\Program Files (x86)\Microsoft\Edge\Application\*\Installer\setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($edgeSetup) {
             try {
-              Start-Process -FilePath $edgeSetup.FullName -ArgumentList "--uninstall", "--system-level", "--verbose-logging", "--force-uninstall" -Wait -NoNewWindow
+              $ep = Start-Process -FilePath $edgeSetup.FullName -ArgumentList "--uninstall", "--system-level", "--force-uninstall" -PassThru -NoNewWindow
+              if (-not $ep.WaitForExit(25000)) { try { $ep.Kill() } catch {} }
             } catch {}
           }
           Remove-Item -Path "C:\Program Files (x86)\Microsoft\Edge" -Recurse -Force -ErrorAction SilentlyContinue
@@ -168,12 +209,12 @@ jobs:
           Remove-Item -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\Users\Default\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
 
+          Write-Host "[2/4] Cleaning Desktop icons..."
           foreach ($d in @($desk, "C:\Users\Default\Desktop")) {
             if (Test-Path $d) {
               Get-ChildItem -Path $d -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
-
           try {
             $hidePath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel'
             if (-not (Test-Path $hidePath)) { New-Item -Path $hidePath -Force | Out-Null }
@@ -181,7 +222,6 @@ jobs:
           } catch {}
 
           $ws = New-Object -ComObject WScript.Shell
-
           $chromeExe = @("C:\Program Files\Google\Chrome\Application\chrome.exe", "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if ($chromeExe) {
             $sc = $ws.CreateShortcut("$desk\Google Chrome.lnk")
@@ -194,28 +234,32 @@ jobs:
           $fm.IconLocation = "C:\Windows\explorer.exe,0"
           $fm.Save()
 
+          Write-Host "[3/4] Installing Telegram Desktop..."
           try {
             $tgZip = "$env:TEMP\telegram.zip"
             $tgDir = "$tools\Telegram"
             New-Item -ItemType Directory -Force -Path $tgDir | Out-Null
-            Invoke-WebRequest -Uri "https://telegram.org/dl/desktop/win64_portable" -OutFile $tgZip -TimeoutSec 60
-            Expand-Archive -Path $tgZip -DestinationPath $tgDir -Force
-            Remove-Item $tgZip -Force -ErrorAction SilentlyContinue
-            $tgExe = Get-ChildItem -Path $tgDir -Recurse -Filter "Telegram.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($tgExe) {
-              $tgs = $ws.CreateShortcut("$desk\Telegram.lnk")
-              $tgs.TargetPath = $tgExe.FullName
-              $tgs.WorkingDirectory = $tgExe.DirectoryName
-              $tgs.Save()
-              Write-Host "Telegram Desktop installed and pinned to Desktop."
+            curl.exe -fsSL --connect-timeout 15 --max-time 60 "https://telegram.org/dl/desktop/win64_portable" -o "$tgZip"
+            if (Test-Path $tgZip) {
+              Expand-Archive -Path $tgZip -DestinationPath $tgDir -Force
+              Remove-Item $tgZip -Force -ErrorAction SilentlyContinue
+              $tgExe = Get-ChildItem -Path $tgDir -Recurse -Filter "Telegram.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($tgExe) {
+                $tgs = $ws.CreateShortcut("$desk\Telegram.lnk")
+                $tgs.TargetPath = $tgExe.FullName
+                $tgs.WorkingDirectory = $tgExe.DirectoryName
+                $tgs.Save()
+                Write-Host "Telegram ready on Desktop."
+              }
             }
           } catch {
-            Write-Host "Telegram portable skipped: $($_.Exception.Message)"
+            Write-Host "Telegram install skipped."
           }
 
+          Write-Host "[4/4] Preparing Roblox Studio..."
           if ("${{ inputs.download_roblox }}" -ne "false") {
             try {
-              Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile "$desk\Roblox Studio.exe" -TimeoutSec 40
+              curl.exe -fsSL --connect-timeout 15 --max-time 45 "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -o "$desk\Roblox Studio.exe"
               Write-Host "Roblox Studio ready on Desktop."
             } catch {
               Write-Host "Skipped Roblox download."

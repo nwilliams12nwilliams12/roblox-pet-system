@@ -1,0 +1,126 @@
+name: Nex RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone_ip:
+        description: Phone Tailscale IP
+        required: false
+        default: ""
+        type: string
+      download_roblox:
+        description: Download Roblox Studio on Desktop
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Verify Tailscale Key
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.TAILSCALE_AUTH_KEY }}")) {
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing in Repo Settings -> Secrets -> Actions!"
+            exit 1
+          }
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User Securely
+        shell: pwsh
+        run: |
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $nums = [char[]](48..57)
+          $syms = @('@', '#', '!', '%', '-', '_')
+          $chars = @()
+          $chars += $upper | Get-Random -Count 4
+          $chars += $lower | Get-Random -Count 5
+          $chars += $nums | Get-Random -Count 4
+          $chars += $syms | Get-Random -Count 3
+          $password = -join ($chars | Sort-Object { Get-Random })
+          Write-Host "::add-mask::$password"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install & Connect Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item $msi -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="nex-rdp-$env:GITHUB_RUN_ID" --unattended
+          $tsIP = $null
+          for ($i = 0; $i -lt 15; $i++) {
+            $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
+            if ($tsIP -and $tsIP.StartsWith("100.")) { break }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned. Make sure your TAILSCALE_AUTH_KEY is Reusable and not expired!"
+            exit 1
+          }
+          Write-Host "::add-mask::$tsIP"
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prepare Roblox Studio Installer
+        if: ${{ inputs.download_roblox != false }}
+        shell: pwsh
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+          $plugins = "C:\Users\RDP\AppData\Local\Roblox\Plugins"
+          New-Item -ItemType Directory -Force -Path $desk | Out-Null
+          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+          try {
+            Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" -OutFile "$desk\RobloxStudioInstaller.exe"
+            Write-Host "Roblox Studio installer ready on Desktop."
+          } catch {
+            Write-Host "Skipped Roblox download."
+          }
+
+      - name: Push Session Over Tailscale & Stay Alive
+        shell: pwsh
+        run: |
+          $phoneIp = "${{ secrets.PHONE_TAILSCALE_IP }}"
+          if ([string]::IsNullOrWhiteSpace($phoneIp)) {
+            $phoneIp = "${{ inputs.phone_ip }}"
+          }
+          $startedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          $payload = @{
+            ip = $env:TAILSCALE_IP
+            user = "RDP"
+            password = $env:RDP_PASSWORD
+            runId = $env:GITHUB_RUN_ID
+            startedAt = $startedMs
+            status = "online"
+          } | ConvertTo-Json -Compress
+
+          Write-Host "RDP Runner is ONLINE. Credentials are being pushed privately over Tailscale to your phone."
+          while ($true) {
+            if (-not [string]::IsNullOrWhiteSpace($phoneIp)) {
+              try {
+                Invoke-RestMethod -Uri "http://${phoneIp}:34873/api/rdp-session" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 6 | Out-Null
+              } catch {}
+              try {
+                Invoke-RestMethod -Uri "http://${phoneIp}:34872/api/rdp-info" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 4 | Out-Null
+              } catch {}
+            }
+            Start-Sleep -Seconds 25
+          }

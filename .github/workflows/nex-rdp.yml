@@ -22,12 +22,15 @@ jobs:
     steps:
       - name: Verify Secrets
         shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          PHONE_SECRET: ${{ secrets.PHONE_TAILSCALE_IP }}
         run: |
-          if ([string]::IsNullOrWhiteSpace("${{ secrets.TAILSCALE_AUTH_KEY }}")) {
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) {
             Write-Error "TAILSCALE_AUTH_KEY secret is missing!"
             exit 1
           }
-          $rawPhone = "${{ secrets.PHONE_TAILSCALE_IP }}"
+          $rawPhone = $env:PHONE_SECRET
           if ([string]::IsNullOrWhiteSpace($rawPhone)) {
             $rawPhone = "${{ inputs.phone_ip }}"
           }
@@ -39,8 +42,6 @@ jobs:
             Write-Host "::add-mask::$phoneIp"
             "LOCKED_PHONE_IP=$phoneIp" | Out-File -FilePath $env:GITHUB_ENV -Append
             Write-Host "Authorized phone IP detected and masked."
-          } else {
-            Write-Host "No phone IP provided; running standard rule."
           }
 
       - name: Configure Phone-Only Locked RDP & 100% Scaling
@@ -73,8 +74,17 @@ jobs:
 
       - name: Create Encrypted RDP User
         shell: pwsh
+        env:
+          RDP_FIXED_SECRET: ${{ secrets.RDP_FIXED_PASSWORD }}
         run: |
-          $fixedPass = "${{ secrets.RDP_FIXED_PASSWORD }}"
+          $cfgPath = "$env:TEMP\secpol.cfg"
+          $sdbPath = "$env:TEMP\secpol.sdb"
+          secedit /export /cfg $cfgPath | Out-Null
+          (Get-Content $cfgPath) -replace 'PasswordComplexity\s*=\s*1', 'PasswordComplexity = 0' -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 1' | Set-Content $cfgPath
+          secedit /configure /db $sdbPath /cfg $cfgPath /areas SECURITYPOLICY | Out-Null
+          Remove-Item $cfgPath, $sdbPath -Force -ErrorAction SilentlyContinue
+
+          $fixedPass = if ($null -ne $env:RDP_FIXED_SECRET) { $env:RDP_FIXED_SECRET.Trim() } else { "" }
           if (-not [string]::IsNullOrWhiteSpace($fixedPass)) {
             $password = $fixedPass
             "FIXED_PASS_USED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -93,13 +103,19 @@ jobs:
           }
           Write-Host "::add-mask::$password"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires $true
+          } else {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install & Connect Tailscale (Fixed Hostname nex-pc)
         shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ProgressPreference = 'SilentlyContinue'
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -107,7 +123,7 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $msi -TimeoutSec 60
           Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
           Remove-Item $msi -Force
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="nex-pc" --unattended
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$($env:TS_KEY.Trim())" --hostname="nex-pc" --unattended
           $tsIP = $null
           for ($i = 0; $i -lt 15; $i++) {
             $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
